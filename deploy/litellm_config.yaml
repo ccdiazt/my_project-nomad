@@ -1,0 +1,52 @@
+# LiteLLM router — unifies the chat and embedding backends behind one OpenAI-compatible
+# endpoint, which is what Project N.O.M.A.D. needs: OllamaService derives a single base URL
+# from the `ai.remoteOllamaUrl` setting and uses it for both chat and embeddings, while vLLM
+# serves one model per process.
+#
+#   nomad_admin ──► LiteLLM :4000 ─┬─► vLLM :8000  (chat)
+#                                  └─► vLLM :8001  (embeddings)
+#
+# Run with:
+#   litellm --config deploy/litellm_config.yaml --port 4000
+#
+# Then in the Command Center: Settings → Models → Remote Ollama URL
+#   http://host.docker.internal:4000        <- no /v1 suffix, the client appends it
+
+model_list:
+  # --- Chat ---------------------------------------------------------------------------
+  # `model_name` is what appears in the Command Center's model picker.
+  # Must match the --served-model-name of the vLLM instance below the api_base.
+  - model_name: nomad-chat
+    litellm_params:
+      model: hosted_vllm/nomad-chat
+      api_base: http://localhost:8000/v1
+      api_key: none
+
+  # --- Embeddings ---------------------------------------------------------------------
+  # The name is load-bearing, not cosmetic: RagService resolves the embedding model by
+  # exact match against RAG_EMBEDDING_MODEL (default nomic-embed-text:v1.5), then falls
+  # back to a substring match. Exposing the real model under this alias keeps the lookup
+  # working whatever you actually serve — set RAG_EMBEDDING_PRESET to match the family so
+  # the prefixes and chunk sizing follow.
+  - model_name: nomic-embed-text:v1.5
+    litellm_params:
+      model: hosted_vllm/nomic-embed-text:v1.5
+      api_base: http://localhost:8001/v1
+      api_key: none
+
+litellm_settings:
+  # Required. The client sends non-standard fields that vLLM may reject outright:
+  #   /v1/chat/completions  -> num_ctx        (an Ollama parameter; vLLM ignores context
+  #                                            hints, the real ceiling is --max-model-len)
+  #   /v1/embeddings        -> truncate, options
+  # drop_params strips anything the target provider doesn't accept.
+  drop_params: true
+
+  # The Command Center streams chat responses; keep buffering off.
+  set_verbose: false
+
+general_settings:
+  # No auth: N.O.M.A.D. sends a placeholder key ('nomad') that no local backend validates.
+  # Bind the router to localhost only — the admin container reaches it through
+  # host.docker.internal, so it never needs to be exposed on the LAN.
+  master_key: null

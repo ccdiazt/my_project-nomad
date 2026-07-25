@@ -284,27 +284,52 @@ sírvelo desde Ollama — pesa ~275 MB y no compite por memoria.
 
 **Opción E2 — `intfloat/multilingual-e5-base` (recomendada para corpus en español).**
 768 dims **nativas** (sin truncar), multilingüe de verdad, y arquitectura `XLMRobertaModel`
-que vLLM sirve sin `trust_remote_code`. Requiere dos ajustes:
+que vLLM sirve sin `trust_remote_code`.
 
-1. En LiteLLM, exponerlo con el alias `nomic-embed-text:v1.5` para satisfacer la búsqueda
-   por nombre. Sin cambios en el código de N.O.M.A.D.
-2. Parche local de 2 líneas para alinear los prefijos con la convención de E5:
-
-   ```ts
-   // admin/app/services/rag_service.ts:62-63
-   public static SEARCH_DOCUMENT_PREFIX = 'passage: '
-   public static SEARCH_QUERY_PREFIX = 'query: '
-   ```
+⚠️ **Tiene una cuarta restricción que no es obvia: su contexto es de 512 tokens**, frente a
+los 8192 de Nomic. El *chunker* apunta a 1500 tokens por fragmento
+(`rag_service.ts:56`), así que con E5 se truncaría alrededor de dos tercios de cada pasaje
+**en silencio** — sin error, solo peor recuperación. El tamaño de *chunk* tiene que bajar
+junto con el resto.
 
 **Opción E3 — `BAAI/bge-m3` (máxima calidad multilingüe).**
-Superior a E2 en recuperación multilingüe y con contexto de 8192, pero **1024 dims**: exige
-además cambiar `EMBEDDING_DIMENSION` a `1024` y borrar la colección de Qdrant. bge-m3 no
-usa prefijos, así que los dos constantes de arriba pasan a cadena vacía. Tres parches en
-total.
+Superior a E2 en recuperación multilingüe, con contexto de 8192 (sin el problema anterior),
+pero **1024 dims**, lo que obliga a reconstruir la colección de Qdrant. No usa prefijos:
+añadírselos sería ruido.
 
-> **Recomendación:** E2. Un alias en el router y dos líneas de parche, a cambio de
-> retrieval decente en español. E1 si tu corpus es mayoritariamente inglés y quieres cero
-> modificaciones. E3 solo si el retrieval es el cuello de botella medido.
+### Implementación: perfiles de *embedding* configurables
+
+Los cuatro parámetros están acoplados al modelo y hay que moverlos **en bloque** — cambiar
+solo la dimensión degrada el *retrieval* sin fallar. En lugar de parchear constantes a mano
+en cada actualización, se añadió un selector por variable de entorno:
+
+| Preset | Dims | Prefijos | Chunk objetivo | Techo |
+|---|---|---|---|---|
+| `nomic` *(por defecto)* | 768 | `search_document: ` / `search_query: ` | 1500 | 1600 |
+| `e5` | 768 | `passage: ` / `query: ` | **400** | **480** |
+| `bge-m3` | 1024 | ninguno | 1500 | 1600 |
+
+```bash
+RAG_EMBEDDING_PRESET=e5        # nomic (defecto) | e5 | bge-m3
+RAG_EMBEDDING_MODEL=           # solo si el backend reporta otro nombre
+RAG_EMBEDDING_DIMENSION=       # solo para checkpoints Matryoshka truncados
+```
+
+El preset `nomic` reproduce exactamente los valores originales, así que **sin configurar
+nada el comportamiento no cambia**. Hay un test de regresión que lo fija
+(`admin/tests/unit/rag_embedding_presets.spec.ts`).
+
+Archivos: `admin/constants/rag_embedding_presets.ts` (datos puros, testeable),
+`admin/constants/rag_embedding.ts` (lectura de entorno), `admin/start/env.ts` (esquema).
+
+El nombre del modelo sigue resolviéndose por búsqueda en el listado del backend, así que
+basta con exponerlo en el router bajo el alias `nomic-embed-text:v1.5` y no hace falta
+tocar `RAG_EMBEDDING_MODEL`.
+
+> **Recomendación:** E2 con `RAG_EMBEDDING_PRESET=e5` — un alias en el router y una
+> variable de entorno, a cambio de retrieval decente en español. E1 si tu corpus es
+> mayoritariamente inglés. E3 si mides que el retrieval es el cuello de botella y aceptas
+> reconstruir la colección; su contexto de 8192 evita además la fragmentación extra de E5.
 
 ⚠️ Cambiar de modelo o de dimensión **después** de haber ingerido documentos obliga a
 borrar y regenerar la colección — los vectores no son comparables entre modelos:
@@ -620,6 +645,7 @@ Otros puntos:
 | 6d | Cambio de modelo de embeddings tras ingerir | Media | Medio | Borrar y regenerar la colección (§3-bis.3) |
 | 7 | Apps del catálogo sin arm64 | Media | Bajo | Auditar antes de instalar (Fase 5) |
 | 8 | `sharp`/`pdf2pic` fallan al compilar en ARM | Baja | Medio | Fijar versión de `sharp` con binarios arm64 |
+| 8a | `@openzim/libzim` sin binario para la arch | Baja | Alto | Publica `linux-aarch64-manylinux`; el build necesita salida a `download.openzim.org` |
 | 9 | GPU no detectada (`lspci` sin GB10) | Baja | Bajo | Solo afecta al Ollama embebido; marcador manual |
 | 10 | Divergencia del fork respecto a upstream | Baja | Bajo | Mantener los parches locales en commits identificables |
 

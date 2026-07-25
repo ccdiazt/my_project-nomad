@@ -62,4 +62,19 @@ export default await Env.create(new URL('../', import.meta.url), {
   |----------------------------------------------------------
   */
   NOMAD_API_URL: Env.schema.string.optional(),
+
+  /*
+  |----------------------------------------------------------
+  | Variables for configuring the RAG embedding backend
+  |----------------------------------------------------------
+  |
+  | Only needed when the AI Assistant points at a backend that does not serve
+  | nomic-embed-text:v1.5 (e.g. a vLLM instance behind an OpenAI-compatible router).
+  | The preset selects vector dimension, task prefixes and chunk sizing as a set —
+  | see constants/rag_embedding.ts. Defaults reproduce the previous behaviour.
+  |
+  */
+  RAG_EMBEDDING_PRESET: Env.schema.enum.optional(['nomic', 'e5', 'bge-m3'] as const),
+  RAG_EMBEDDING_MODEL: Env.schema.string.optional(),
+  RAG_EMBEDDING_DIMENSION: Env.schema.number.optional(),
 })

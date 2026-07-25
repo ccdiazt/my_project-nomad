@@ -25,7 +25,7 @@ import type { FileWarning, FileWarningsResult, StoredFileInfo } from '../../type
 import type { KbIngestStateValue } from '../../types/kb_ingest_state.js'
 import { ZIMExtractionService } from './zim_extraction_service.js'
 import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
-import { EMBEDDING_MODEL_NAME } from '../../constants/ollama.js'
+import { RAG_EMBEDDING_PROFILE } from '../../constants/rag_embedding.js'
 import { ProcessAndEmbedFileResponse, ProcessZIMFileResponse, RAGResult, RerankedRAGResult } from '../../types/rag.js'
 
 export type EmbedSingleFileFailureCode =
@@ -46,21 +46,29 @@ export class RagService {
   private resolvedEmbeddingModel: string | null = null
   public static UPLOADS_STORAGE_PATH = 'storage/kb_uploads'
   public static CONTENT_COLLECTION_NAME = 'nomad_knowledge_base'
-  public static EMBEDDING_DIMENSION = 768 // Nomic Embed Text v1.5 dimension is 768
+  // Embedding-backend-dependent values. Defaults match nomic-embed-text:v1.5; override as a
+  // set via RAG_EMBEDDING_PRESET (see constants/rag_embedding.ts). Changing the dimension or
+  // the model requires rebuilding the Qdrant collection — vectors are not comparable across
+  // embedding models.
+  public static EMBEDDING_DIMENSION = RAG_EMBEDDING_PROFILE.dimension
   // Upper bound on distinct sources returned by Qdrant's facet API. Real
   // NOMADs cap out at a few hundred ZIM files + uploaded PDFs; 10k leaves
   // generous headroom without paying the cost of an unbounded request.
   public static FACET_SOURCE_LIMIT = 10_000
   public static MODEL_CONTEXT_LENGTH = 2048 // nomic-embed-text has 2K token context
-  public static MAX_SAFE_TOKENS = 1600 // Leave buffer for prefix and tokenization variance
-  public static TARGET_TOKENS_PER_CHUNK = 1500 // Target 1500 tokens per chunk for embedding
+  // Leave buffer for prefix and tokenization variance. Shrinks with the preset: e5's
+  // XLM-R backbone caps at 512 tokens, so nomic-sized chunks would be truncated at embed time.
+  public static MAX_SAFE_TOKENS = RAG_EMBEDDING_PROFILE.maxSafeTokens
+  public static TARGET_TOKENS_PER_CHUNK = RAG_EMBEDDING_PROFILE.targetTokensPerChunk
   public static PREFIX_TOKEN_BUDGET = 10 // Reserve ~10 tokens for prefixes
   public static CHAR_TO_TOKEN_RATIO = 2 // Conservative chars-per-token estimate; technical docs
                                          // (numbers, symbols, abbreviations) tokenize denser
                                          // than plain prose (~3), so 2 avoids context overflows
-  // Nomic Embed Text v1.5 uses task-specific prefixes for optimal performance
-  public static SEARCH_DOCUMENT_PREFIX = 'search_document: '
-  public static SEARCH_QUERY_PREFIX = 'search_query: '
+  // Task-specific prefixes. These are a per-model-family convention, not a general one:
+  // Nomic uses search_document/search_query, E5 uses passage/query, and bge-m3 uses none.
+  // Feeding a model the wrong family's prefixes degrades recall instead of erroring.
+  public static SEARCH_DOCUMENT_PREFIX = RAG_EMBEDDING_PROFILE.documentPrefix
+  public static SEARCH_QUERY_PREFIX = RAG_EMBEDDING_PROFILE.queryPrefix
   public static EMBEDDING_BATCH_SIZE = 8 // Conservative batch size for low-end hardware
 
   constructor(
@@ -291,25 +299,29 @@ export class RagService {
       if (!this.embeddingModelVerified) {
         const allModels = await this.ollamaService.getModels(true)
         const embeddingModel =
-          allModels.find((model) => model.name === EMBEDDING_MODEL_NAME) ??
-          allModels.find((model) => model.name.toLowerCase().includes('nomic-embed-text'))
+          allModels.find((model) => model.name === RAG_EMBEDDING_PROFILE.modelName) ??
+          allModels.find((model) =>
+            model.name.toLowerCase().includes(RAG_EMBEDDING_PROFILE.modelMatch)
+          )
 
         if (!embeddingModel) {
           try {
-            const downloadResult = await this.ollamaService.downloadModel(EMBEDDING_MODEL_NAME)
+            const downloadResult = await this.ollamaService.downloadModel(
+              RAG_EMBEDDING_PROFILE.modelName
+            )
             if (!downloadResult.success) {
               throw new Error(downloadResult.message || 'Unknown error during model download')
             }
           } catch (modelError) {
             logger.error(
-              `[RAG] Embedding model ${EMBEDDING_MODEL_NAME} not found locally and failed to download:`,
+              `[RAG] Embedding model ${RAG_EMBEDDING_PROFILE.modelName} not found locally and failed to download:`,
               modelError
             )
             this.embeddingModelVerified = false
             return null
           }
         }
-        this.resolvedEmbeddingModel = embeddingModel?.name ?? EMBEDDING_MODEL_NAME
+        this.resolvedEmbeddingModel = embeddingModel?.name ?? RAG_EMBEDDING_PROFILE.modelName
         this.embeddingModelVerified = true
       }
 
@@ -366,7 +378,7 @@ export class RagService {
 
         logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
 
-        const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME, batch)
+        const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? RAG_EMBEDDING_PROFILE.modelName, batch)
 
         embeddings.push(...response.embeddings)
 
@@ -823,12 +835,14 @@ export class RagService {
       if (!this.embeddingModelVerified) {
         const allModels = await this.ollamaService.getModels(true)
         const embeddingModel =
-          allModels.find((model) => model.name === EMBEDDING_MODEL_NAME) ??
-          allModels.find((model) => model.name.toLowerCase().includes('nomic-embed-text'))
+          allModels.find((model) => model.name === RAG_EMBEDDING_PROFILE.modelName) ??
+          allModels.find((model) =>
+            model.name.toLowerCase().includes(RAG_EMBEDDING_PROFILE.modelMatch)
+          )
 
         if (!embeddingModel) {
           logger.warn(
-            `[RAG] ${EMBEDDING_MODEL_NAME} not found. Cannot perform similarity search.`
+            `[RAG] ${RAG_EMBEDDING_PROFILE.modelName} not found. Cannot perform similarity search.`
           )
           this.embeddingModelVerified = false
           return []
@@ -860,7 +874,7 @@ export class RagService {
         return []
       }
 
-      const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME, [prefixedQuery])
+      const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? RAG_EMBEDDING_PROFILE.modelName, [prefixedQuery])
 
       // Perform semantic search with a higher limit to enable reranking
       const searchLimit = limit * 3 // Get more results for reranking

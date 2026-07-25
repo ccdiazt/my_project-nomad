@@ -1,0 +1,130 @@
+# Project N.O.M.A.D. — Command Center on NVIDIA DGX Spark (aarch64)
+#
+# Derived from install/management_compose.yaml with the changes required to run on ARM64
+# against an external inference backend. See docs/deploy-dgx-spark.md for the full plan.
+#
+# Differences from the stock compose, and why:
+#   1. Images point at locally built :local-arm64 tags — the published GHCR images are
+#      single-arch amd64 (the build workflows omit `platforms:`).
+#   2. `pull_policy: always` is removed everywhere. Left in, Docker would fetch the amd64
+#      manifest from GHCR on every `up` and clobber the local ARM build.
+#   3. The `updater` sidecar is omitted. It rewrites the image tag in this file and pulls
+#      from GHCR, which would replace the ARM build with an amd64 one and take the Command
+#      Center down. Update by rebuilding — see deploy/README.md.
+#   4. Secrets come from a .env file next to this one instead of inline `replaceme` values.
+#   5. RAG_EMBEDDING_* selects the embedding profile for a non-Ollama backend.
+#
+# Usage:
+#   cp deploy/.env.dgx-spark.example deploy/.env && $EDITOR deploy/.env
+#   docker compose --env-file deploy/.env -f deploy/docker-compose.dgx-spark.yml up -d
+
+name: project-nomad
+
+services:
+  admin:
+    image: project-nomad:local-arm64
+    container_name: nomad_admin
+    restart: unless-stopped
+    extra_hosts:
+      # Lets the container reach the inference router running on the Spark itself.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${NOMAD_STORAGE_PATH:-/opt/project-nomad/storage}:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - NODE_ENV=production
+      - NOMAD_STORAGE_PATH=${NOMAD_STORAGE_PATH:-/opt/project-nomad/storage}
+      - PORT=8080
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - APP_KEY=${APP_KEY:?APP_KEY is required — generate one with: openssl rand -hex 24}
+      - HOST=0.0.0.0
+      - URL=${NOMAD_URL:?NOMAD_URL is required — e.g. http://192.168.1.50:8080}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=nomad
+      - DB_USER=nomad_user
+      - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+      - DB_NAME=nomad
+      - DB_SSL=false
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DISABLE_COMPRESSION=false
+
+      # --- RAG embedding profile -------------------------------------------------------
+      # Selects vector dimension, task prefixes and chunk sizing as a coherent set.
+      #   nomic  : nomic-embed-text:v1.5 — 768 dims, upstream default, English-centric
+      #   e5     : multilingual-e5-{small,base} — 768 dims, 512-token context
+      #   bge-m3 : BAAI/bge-m3 — 1024 dims, 8192-token context, no prefixes
+      # Changing this after documents have been ingested requires rebuilding the Qdrant
+      # collection: curl -X DELETE http://localhost:6333/collections/nomad_knowledge_base
+      - RAG_EMBEDDING_PRESET=${RAG_EMBEDDING_PRESET:-nomic}
+      # Name the backend reports for the embedding model. Leave unset when the router
+      # already aliases it to nomic-embed-text:v1.5.
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-}
+      # Escape hatch for a checkpoint whose dimension differs from its preset (e.g. a
+      # Matryoshka model truncated to a non-default size). Leave unset otherwise.
+      - RAG_EMBEDDING_DIMENSION=${RAG_EMBEDDING_DIMENSION:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mysql:
+    image: mysql:8.0
+    container_name: nomad_mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      - MYSQL_DATABASE=nomad
+      - MYSQL_USER=nomad_user
+      - MYSQL_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - ${NOMAD_DATA_PATH:-/opt/project-nomad}/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: nomad_redis
+    restart: unless-stopped
+    volumes:
+      - ${NOMAD_DATA_PATH:-/opt/project-nomad}/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dozzle:
+    # Optional log viewer. Settings → "Service Logs & Metrics" links here.
+    image: amir20/dozzle:v10.0
+    container_name: nomad_dozzle
+    restart: unless-stopped
+    ports:
+      - "9999:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOZZLE_ENABLE_ACTIONS=false
+      - DOZZLE_ENABLE_SHELL=false
+
+  disk-collector:
+    # Feeds host disk usage to the admin UI. Built locally for arm64 from
+    # install/sidecar-disk-collector.
+    image: project-nomad-disk-collector:local-arm64
+    container_name: nomad_disk_collector
+    restart: unless-stopped
+    volumes:
+      - /:/host:ro,rslave
+      - ${NOMAD_STORAGE_PATH:-/opt/project-nomad/storage}:/storage

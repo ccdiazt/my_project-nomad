@@ -3,7 +3,8 @@ import OpenAI from 'openai'
 import type { ChatCompletionChunk, ChatCompletionMessageParam } from 'openai/resources/chat/completions.js'
 import type { Stream } from 'openai/streaming.js'
 import { NomadOllamaModel } from '../../types/ollama.js'
-import { EMBEDDING_MODEL_NAME, FALLBACK_RECOMMENDED_OLLAMA_MODELS } from '../../constants/ollama.js'
+import { FALLBACK_RECOMMENDED_OLLAMA_MODELS } from '../../constants/ollama.js'
+import { RAG_EMBEDDING_PROFILE } from '../../constants/rag_embedding.js'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import logger from '@adonisjs/core/services/logger'
@@ -680,7 +681,7 @@ export class OllamaService {
     }
 
     const toUnload = loadedModels.filter(
-      (name) => name !== EMBEDDING_MODEL_NAME && name !== targetModel
+      (name) => name !== RAG_EMBEDDING_PROFILE.modelName && name !== targetModel
     )
 
     await Promise.all(
