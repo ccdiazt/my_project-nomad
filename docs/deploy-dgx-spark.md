@@ -198,6 +198,218 @@ Para que el RAG lo acepte sin tocar código, el *deployment* de embeddings debe:
 
 ---
 
+## 3-bis. Diseño concreto para vLLM + RAG *(configuración elegida)*
+
+Stack objetivo: **vLLM como motor principal, RAG con documentos propios.** Esto fija la
+Opción C. Arquitectura resultante:
+
+```
+nomad_admin  ──►  http://host.docker.internal:4000     (LiteLLM, router OpenAI-compatible)
+                       ├── chat       ──►  vLLM  :8000   (modelo grande, 4-bit)
+                       └── embeddings ──►  vLLM  :8001   (modelo de embeddings)
+                                             · o bien Ollama :11434, si prefieres
+```
+
+### 3-bis.1 Por qué hace falta el router
+
+vLLM sirve **un modelo por proceso**, y N.O.M.A.D. tiene un único `baseUrl` para chat y
+embeddings (§2.9). El router los unifica bajo un solo puerto. Cualquier proxy
+OpenAI-compatible sirve; LiteLLM es el más directo.
+
+### 3-bis.2 Hallazgos específicos de vLLM
+
+**a) `--max-model-len` es el límite real, no `num_ctx`.**
+`admin/app/controllers/ollama_controller.ts:140-144`: cuando el contexto RAG engorda el
+system prompt, N.O.M.A.D. pide `num_ctx` escalando por `[8192, 16384, 32768, 65536]`. Ese
+parámetro es de Ollama; **vLLM lo ignora**. El techo efectivo es el `--max-model-len` con
+el que arrancaste el servidor. Si lo dejas corto, las consultas RAG con mucho contexto
+fallarán con *context length exceeded* en lugar de degradarse.
+
+→ Arranca vLLM con `--max-model-len 32768` como mínimo.
+
+**b) NO habilites `--reasoning-parser` en vLLM.**
+El normalizador de streaming (`ollama_service.ts:384-429`) extrae el razonamiento de dos
+sitios: `delta.thinking` (nativo de Ollama) y etiquetas `<think>…</think>` incrustadas en
+`delta.content`, con un parser que aguanta etiquetas partidas entre *chunks*. **No lee
+`delta.reasoning_content`**, que es justamente donde vLLM coloca el razonamiento cuando
+activas su *reasoning parser*.
+
+→ Con el parser activado, el razonamiento del modelo se pierde en silencio. Déjalo
+desactivado y que las etiquetas `<think>` fluyan inline: N.O.M.A.D. las separa solo.
+
+Nota relacionada: `checkModelHasThinking()` (`ollama_service.ts:435-450`) consulta
+`/api/show`, que no existe fuera de Ollama, y devuelve `false`. Es decir, el parámetro
+`think` **nunca** se envía a vLLM. Sin efectos secundarios.
+
+**c) Parámetros extra en el cuerpo de la petición.**
+El código envía campos que no son del estándar OpenAI:
+
+- a `/v1/chat/completions`: `num_ctx` (`ollama_service.ts:332-334, 363-365`)
+- a `/v1/embeddings`: `truncate: true` y `options: { num_ctx: 8192 }`
+  (`ollama_service.ts:596-602`)
+
+Según la versión de vLLM esto se ignora con un warning o se rechaza. **Verificar antes de
+dar por buena la instalación:**
+
+```bash
+curl -s http://localhost:8001/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nomic-embed-text:v1.5","input":["hola"],
+       "encoding_format":"float","truncate":true,"options":{"num_ctx":8192}}' | head -c 300
+```
+
+Si devuelve error de validación, la solución limpia es `drop_params: true` en LiteLLM, que
+descarta los parámetros no soportados por el proveedor destino.
+
+### 3-bis.3 Elección del modelo de embeddings — el punto crítico
+
+El RAG impone **tres** restricciones simultáneas, no solo la dimensión:
+
+| Restricción | Valor | Origen |
+|---|---|---|
+| Dimensión del vector | **768** | `rag_service.ts:49` (`EMBEDDING_DIMENSION`) |
+| Nombre del modelo | debe contener `nomic-embed-text` | `rag_service.ts:293-296` |
+| Prefijos de indexación | `search_document: ` / `search_query: ` | `rag_service.ts:62-63` |
+
+La tercera es la que se suele pasar por alto: esos prefijos son la convención de **Nomic**.
+Si sirves un modelo de otra familia, los prefijos se convierten en ruido asimétrico —
+el sistema funciona, pero la calidad del *recall* baja.
+
+**Opción E1 — `nomic-embed-text-v1.5` (fricción cero).**
+768 dims nativas, contexto 8192 (coincide con el `num_ctx` que pide el código), prefijos
+correctos por construcción. Ningún parche. Contrapartida: está entrenado con foco en
+inglés; con corpus en español el *recall* es notablemente peor.
+Si vLLM no soporta su arquitectura (`NomicBertModel`, requiere `trust_remote_code`),
+sírvelo desde Ollama — pesa ~275 MB y no compite por memoria.
+
+**Opción E2 — `intfloat/multilingual-e5-base` (recomendada para corpus en español).**
+768 dims **nativas** (sin truncar), multilingüe de verdad, y arquitectura `XLMRobertaModel`
+que vLLM sirve sin `trust_remote_code`. Requiere dos ajustes:
+
+1. En LiteLLM, exponerlo con el alias `nomic-embed-text:v1.5` para satisfacer la búsqueda
+   por nombre. Sin cambios en el código de N.O.M.A.D.
+2. Parche local de 2 líneas para alinear los prefijos con la convención de E5:
+
+   ```ts
+   // admin/app/services/rag_service.ts:62-63
+   public static SEARCH_DOCUMENT_PREFIX = 'passage: '
+   public static SEARCH_QUERY_PREFIX = 'query: '
+   ```
+
+**Opción E3 — `BAAI/bge-m3` (máxima calidad multilingüe).**
+Superior a E2 en recuperación multilingüe y con contexto de 8192, pero **1024 dims**: exige
+además cambiar `EMBEDDING_DIMENSION` a `1024` y borrar la colección de Qdrant. bge-m3 no
+usa prefijos, así que los dos constantes de arriba pasan a cadena vacía. Tres parches en
+total.
+
+> **Recomendación:** E2. Un alias en el router y dos líneas de parche, a cambio de
+> retrieval decente en español. E1 si tu corpus es mayoritariamente inglés y quieres cero
+> modificaciones. E3 solo si el retrieval es el cuello de botella medido.
+
+⚠️ Cambiar de modelo o de dimensión **después** de haber ingerido documentos obliga a
+borrar y regenerar la colección — los vectores no son comparables entre modelos:
+
+```bash
+curl -X DELETE http://localhost:6333/collections/nomad_knowledge_base
+```
+
+### 3-bis.4 Elección del modelo de chat
+
+En el DGX Spark el factor limitante de la generación **no es el cómputo, es el ancho de
+banda de memoria**. Los ~128 GB son LPDDR5X unificada a unos ~273 GB/s: cada token
+generado requiere recorrer los pesos del modelo una vez, así que el techo teórico de
+velocidad es aproximadamente `ancho_de_banda / tamaño_del_modelo_en_memoria`.
+
+Envelope práctico para chat interactivo (una sola sesión):
+
+| Tamaño y cuantización | Pesos en memoria | Techo teórico | Esperable en la práctica |
+|---|---|---|---|
+| ~30B en 4-bit | ~16 GB | ~17 tok/s | ~10–13 tok/s |
+| ~30B en 8-bit | ~31 GB | ~9 tok/s | ~5–6 tok/s |
+| ~70B en 4-bit | ~38 GB | ~7 tok/s | ~4–5 tok/s |
+
+Conclusión operativa: **modelos de ~26–32B en 4 bits son el punto dulce** para un
+asistente conversacional en este equipo. Los 128 GB permiten cargar mucho más, pero la
+generación se vuelve incómodamente lenta para un chat.
+
+Dos matices favorables al caso de uso RAG:
+
+- El *prefill* (procesar el contexto recuperado) sí es intensivo en cómputo, y ahí el GB10
+  rinde bien. La latencia hasta el primer token con contextos largos será razonable.
+- GB10 es Blackwell y tiene **FP4 nativo**. Si existe un checkpoint NVFP4 de tu modelo,
+  vLLM lo aprovecha con hardware dedicado en lugar de emular la descuantización. Merece la
+  prueba frente a un GPTQ/AWQ int4 equivalente.
+
+Presupuesto de memoria a repartir entre: pesos del modelo de chat + caché KV + modelo de
+embeddings + el resto del stack N.O.M.A.D. La caché KV a 32k de contexto en un modelo de
+30B ronda los 5–7 GB en FP16; `--kv-cache-dtype fp8` la reduce a la mitad y deja holgura
+para subir `--max-model-len`.
+
+### 3-bis.5 Configuración de referencia
+
+Servidor de chat:
+
+```bash
+vllm serve <tu-modelo-4bit> \
+  --port 8000 \
+  --served-model-name nomad-chat \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8 \
+  --gpu-memory-utilization 0.75
+  # sin --reasoning-parser  (ver §3-bis.2b)
+```
+
+Servidor de embeddings:
+
+```bash
+vllm serve intfloat/multilingual-e5-base \
+  --port 8001 \
+  --task embed \
+  --served-model-name nomic-embed-text:v1.5   # alias exigido por rag_service.ts:293-296
+```
+
+Router (`litellm_config.yaml`):
+
+```yaml
+model_list:
+  - model_name: nomad-chat
+    litellm_params:
+      model: hosted_vllm/nomad-chat
+      api_base: http://localhost:8000/v1
+  - model_name: nomic-embed-text:v1.5
+    litellm_params:
+      model: hosted_vllm/nomic-embed-text:v1.5
+      api_base: http://localhost:8001/v1
+
+litellm_settings:
+  drop_params: true    # descarta num_ctx / truncate  (ver §3-bis.2c)
+```
+
+```bash
+litellm --config litellm_config.yaml --port 4000
+```
+
+URL a introducir en N.O.M.A.D. → **`http://host.docker.internal:4000`** (sin `/v1`).
+
+### 3-bis.6 Qué se pierde con esta arquitectura
+
+Al no ser un backend Ollama nativo, `isOllamaNative` queda en `false`
+(`ollama_service.ts:729`) y se desactivan funciones que dependen de la API propietaria:
+
+| Función | Estado | Impacto |
+|---|---|---|
+| Descarga de modelos desde la UI | ❌ | Gestionas los modelos en vLLM/HF a mano |
+| Tamaños de modelo en el listado | ❌ | Aparecen como `0` |
+| Borrado de modelos desde la UI | ❌ | `/api/delete` no existe |
+| Detección de *thinking* | ❌ → inline | Funciona igual vía etiquetas `<think>` |
+| Pacing de embeddings por VRAM (`/api/ps`) | ❌ | Irrelevante: en GPU no hace falta |
+| Chat + streaming + razonamiento | ✅ | Sin pérdida |
+| RAG completo | ✅ | Con la config de arriba |
+
+Ninguna es bloqueante para el objetivo planteado.
+
+---
+
 ## 4. Fases de ejecución
 
 ### Fase 0 — Inventario y preparación
@@ -402,6 +614,10 @@ Otros puntos:
 | 4 | URL del backend con `/v1` → doble prefijo | Alta | Medio | Documentado en §2.6 |
 | 5 | Backend en `127.0.0.1`, inalcanzable desde el contenedor | Media | Medio | `OLLAMA_HOST=0.0.0.0` + `host.docker.internal` |
 | 6 | Embeddings ausentes o de dimensión ≠ 768 | Media | Medio | Ollama nativo, o router con nombre/dimensión correctos (Fase 4) |
+| 6a | `--max-model-len` corto → fallos con contexto RAG largo | Alta | Medio | Arrancar vLLM con ≥ 32768 (§3-bis.2a) |
+| 6b | `--reasoning-parser` activo → razonamiento perdido | Media | Bajo | No habilitarlo (§3-bis.2b) |
+| 6c | vLLM rechaza `num_ctx` / `truncate` | Media | Medio | `drop_params: true` en LiteLLM (§3-bis.2c) |
+| 6d | Cambio de modelo de embeddings tras ingerir | Media | Medio | Borrar y regenerar la colección (§3-bis.3) |
 | 7 | Apps del catálogo sin arm64 | Media | Bajo | Auditar antes de instalar (Fase 5) |
 | 8 | `sharp`/`pdf2pic` fallan al compilar en ARM | Baja | Medio | Fijar versión de `sharp` con binarios arm64 |
 | 9 | GPU no detectada (`lspci` sin GB10) | Baja | Bajo | Solo afecta al Ollama embebido; marcador manual |
